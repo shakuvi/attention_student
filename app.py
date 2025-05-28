@@ -1005,7 +1005,7 @@ def initialize_session_state():
 
 def login_page():
     """Login page for both lecturers and students"""
-    st.title("🎓 Lecture Attention Tracking System")
+    st.title("🎓 AI-Driven Attention Analytics for Online Lectures")
     st.subheader("Login")
 
     col1, col2, col3 = st.columns([1, 2, 1])
