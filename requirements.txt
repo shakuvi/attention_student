@@ -13,3 +13,4 @@ pymongo
 mediapipe
 opencv-python-headless
 plotly
+sklearn
