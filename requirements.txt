@@ -1,0 +1,11 @@
+streamlit
+opencv-python
+mediapipe
+torch
+torchvision
+numpy
+pandas
+matplotlib
+joblib
+altair
+streamlit-webrtc
