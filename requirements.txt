@@ -9,3 +9,4 @@ matplotlib
 joblib
 altair
 streamlit-webrtc
+pymongo
