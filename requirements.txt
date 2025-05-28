@@ -12,4 +12,4 @@ streamlit-webrtc
 pymongo
 mediapipe
 opencv-python-headless
-
+plotly
