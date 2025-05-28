@@ -17,7 +17,6 @@ import hashlib
 import uuid
 from typing import Optional, List, Dict, Any
 import plotly.graph_objects as go
-import os
 
 # ───────── CONFIG ─────────
 MODEL_DIR = 'run_mlp'
@@ -27,7 +26,7 @@ AXIS_LEN = 50          # mm for drawing head-pose axes
 SIGMOID_TH = 0.5       # threshold on sigmoid(logit)
 SMOOTHING_ALPHA = 0.8  # EMA smoothing factor
 DATA_HISTORY_LENGTH = 1000
-MONGO_URI = os.environ["MONGO_URI"]
+MONGO_URI = "mongodb+srv://shaku:x15j5GBBUtMhnNe6@cluster0.ghh0q.mongodb.net/"
 DB_NAME = "lecture_attention"
 
 # PnP model points (nose tip, chin, eye corners, mouth corners)
@@ -720,15 +719,6 @@ def login_page():
                         st.error("Invalid username or password")
                 else:
                     st.error("Please enter both username and password")
-
-        st.divider()
-
-        # Demo credentials
-        st.info("**Demo Credentials:**")
-        st.write("Lecturer: admin / admin123")
-        st.write("Student: student1 / student123")
-
-        st.divider()
 
         # Registration section
         st.subheader("New User Registration")
