@@ -8,288 +8,594 @@ import joblib
 import os
 import time
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 import altair as alt
 from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
-from pymongo import MongoClient, ASCENDING
-from bson.objectid import ObjectId
+import sqlite3
 import hashlib
 import uuid
 from typing import Optional, List, Dict, Any
+import threading
+import queue
+import plotly.express as px
 import plotly.graph_objects as go
 
 # ───────── CONFIG ─────────
 MODEL_DIR = 'run_mlp'
 MODEL_PATH = os.path.join(MODEL_DIR, 'best_geom_mlp.pth')
 SCALER_PATH = os.path.join(MODEL_DIR, 'scaler.joblib')
-AXIS_LEN = 50          # mm for drawing head-pose axes
-SIGMOID_TH = 0.5       # threshold on sigmoid(logit)
+AXIS_LEN = 50  # mm for drawing head‐pose axes
+SIGMOID_TH = 0.5  # threshold on sigmoid(logit)
 SMOOTHING_ALPHA = 0.8  # EMA smoothing factor
-DATA_HISTORY_LENGTH = 1000
-MONGO_URI = "mongodb+srv://shaku:x15j5GBBUtMhnNe6@cluster0.ghh0q.mongodb.net/"
-DB_NAME = "lecture_attention"
+DATA_HISTORY_LENGTH = 1000  # Maximum number of data points to keep in memory
+DATABASE_PATH = 'attention_tracking.db'
 
 # PnP model points (nose tip, chin, eye corners, mouth corners)
 PNP_IDS = [1, 152, 33, 263, 61, 291]
 MODEL_3D = np.array([
-    (0.0,     0.0,   0.0),
-    (0.0,   -63.6, -12.5),
-    (-43.3,  32.7, -26.0),
-    (43.3,   32.7, -26.0),
+    (0.0, 0.0, 0.0),
+    (0.0, -63.6, -12.5),
+    (-43.3, 32.7, -26.0),
+    (43.3, 32.7, -26.0),
     (-28.9, -28.9, -24.1),
-    (28.9,  -28.9, -24.1),
+    (28.9, -28.9, -24.1),
 ], dtype=np.float64)
 
-# WebRTC STUN server
+# RTC Configuration
 RTC_CONFIGURATION = RTCConfiguration(
     {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
 )
 
-# ═══════════════════════════════════════════════════════════
-# DATABASE (MongoDB) LAYER
-# ═══════════════════════════════════════════════════════════
+
+# ────────────────────────────────────────────────────────────
+# DATABASE MANAGEMENT
+# ────────────────────────────────────────────────────────────
+
 class DatabaseManager:
-    """All CRUD operations backed by MongoDB Atlas."""
+    def __init__(self, db_path: str = DATABASE_PATH):
+        self.db_path = db_path
+        self.init_database()
 
-    def __init__(self,
-                 uri: str = MONGO_URI,
-                 db_name: str = DB_NAME):
-        self.client = MongoClient(uri, serverSelectionTimeoutMS=10_000)
-        self.db = self.client[db_name]
+    def init_database(self):
+        """Initialize the database with required tables"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
 
-        # Collections
-        self.users               = self.db['users']
-        self.lecture_sessions    = self.db['lecture_sessions']
-        self.session_participants = self.db['session_participants']
-        self.attention_data      = self.db['attention_data']
+        # Users table
+        cursor.execute('''
+                       CREATE TABLE IF NOT EXISTS users
+                       (
+                           id
+                           INTEGER
+                           PRIMARY
+                           KEY
+                           AUTOINCREMENT,
+                           username
+                           TEXT
+                           UNIQUE
+                           NOT
+                           NULL,
+                           password_hash
+                           TEXT
+                           NOT
+                           NULL,
+                           role
+                           TEXT
+                           NOT
+                           NULL
+                           CHECK (
+                           role
+                           IN
+                       (
+                           'lecturer',
+                           'student'
+                       )),
+                           full_name TEXT NOT NULL,
+                           email TEXT,
+                           created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                           )
+                       ''')
 
-        # Indexes for faster lookup
-        self.users.create_index("username", unique=True)
-        self.lecture_sessions.create_index("session_id", unique=True)
-        self.session_participants.create_index(
-            [("session_id", ASCENDING), ("student_id", ASCENDING)])
-        self.attention_data.create_index(
-            [("session_id", ASCENDING), ("student_id", ASCENDING)])
+        # Lecture sessions table
+        cursor.execute('''
+                       CREATE TABLE IF NOT EXISTS lecture_sessions
+                       (
+                           id
+                           INTEGER
+                           PRIMARY
+                           KEY
+                           AUTOINCREMENT,
+                           session_id
+                           TEXT
+                           UNIQUE
+                           NOT
+                           NULL,
+                           lecturer_id
+                           INTEGER
+                           NOT
+                           NULL,
+                           title
+                           TEXT
+                           NOT
+                           NULL,
+                           description
+                           TEXT,
+                           start_time
+                           TIMESTAMP,
+                           end_time
+                           TIMESTAMP,
+                           status
+                           TEXT
+                           DEFAULT
+                           'planned'
+                           CHECK (
+                           status
+                           IN
+                       (
+                           'planned',
+                           'active',
+                           'ended'
+                       )),
+                           created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                           FOREIGN KEY
+                       (
+                           lecturer_id
+                       ) REFERENCES users
+                       (
+                           id
+                       )
+                           )
+                       ''')
 
+        # Session participants table
+        cursor.execute('''
+                       CREATE TABLE IF NOT EXISTS session_participants
+                       (
+                           id
+                           INTEGER
+                           PRIMARY
+                           KEY
+                           AUTOINCREMENT,
+                           session_id
+                           TEXT
+                           NOT
+                           NULL,
+                           student_id
+                           INTEGER
+                           NOT
+                           NULL,
+                           joined_at
+                           TIMESTAMP,
+                           left_at
+                           TIMESTAMP,
+                           FOREIGN
+                           KEY
+                       (
+                           session_id
+                       ) REFERENCES lecture_sessions
+                       (
+                           session_id
+                       ),
+                           FOREIGN KEY
+                       (
+                           student_id
+                       ) REFERENCES users
+                       (
+                           id
+                       )
+                           )
+                       ''')
+
+        # Attention data table
+        cursor.execute('''
+                       CREATE TABLE IF NOT EXISTS attention_data
+                       (
+                           id
+                           INTEGER
+                           PRIMARY
+                           KEY
+                           AUTOINCREMENT,
+                           session_id
+                           TEXT
+                           NOT
+                           NULL,
+                           student_id
+                           INTEGER
+                           NOT
+                           NULL,
+                           timestamp
+                           TIMESTAMP
+                           NOT
+                           NULL,
+                           yaw
+                           REAL,
+                           pitch
+                           REAL,
+                           left_h
+                           REAL,
+                           left_v
+                           REAL,
+                           right_h
+                           REAL,
+                           right_v
+                           REAL,
+                           prob
+                           REAL,
+                           smoothed_prob
+                           REAL,
+                           attention_status
+                           TEXT,
+                           FOREIGN
+                           KEY
+                       (
+                           session_id
+                       ) REFERENCES lecture_sessions
+                       (
+                           session_id
+                       ),
+                           FOREIGN KEY
+                       (
+                           student_id
+                       ) REFERENCES users
+                       (
+                           id
+                       )
+                           )
+                       ''')
+
+        conn.commit()
+        conn.close()
+
+        # Create default admin user if not exists
         self.create_default_users()
 
-    # ───── Utilities ─────
-    @staticmethod
-    def hash_password(password: str) -> str:
+    def create_default_users(self):
+        """Create default lecturer and student for testing"""
+        try:
+            self.create_user("admin", "admin123", "lecturer", "Administrator", "admin@example.com")
+            self.create_user("student1", "student123", "student", "John Doe", "john@example.com")
+        except Exception:
+            pass  # Users might already exist
+
+    def hash_password(self, password: str) -> str:
+        """Hash password using SHA-256"""
         return hashlib.sha256(password.encode()).hexdigest()
 
-    def _user_doc(self, doc) -> Dict[str, Any]:
-        """Convert raw Mongo document to a sanitary dict used by the app."""
-        if not doc:
-            return None
-        return {
-            "id": str(doc["_id"]),
-            "username": doc["username"],
-            "role": doc["role"],
-            "full_name": doc["full_name"],
-            "email": doc.get("email")
-        }
+    def create_user(self, username: str, password: str, role: str, full_name: str, email: str = None) -> bool:
+        """Create a new user"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
 
-    # ───── User Management ─────
-    def create_default_users(self):
-        """Insert one default lecturer + student if DB is empty."""
-        if self.users.count_documents({}) == 0:
-            self.create_user("admin",   "admin123",   "lecturer",
-                             "Administrator",   "admin@example.com")
-            self.create_user("student1", "student123", "student",
-                             "John Doe",        "john@example.com")
-
-    def create_user(self, username: str, password: str, role: str,
-                    full_name: str, email: str = None) -> bool:
         try:
-            self.users.insert_one({
-                "username": username,
-                "password_hash": self.hash_password(password),
-                "role": role,
-                "full_name": full_name,
-                "email": email,
-                "created_at": datetime.utcnow()
-            })
+            password_hash = self.hash_password(password)
+            cursor.execute('''
+                           INSERT INTO users (username, password_hash, role, full_name, email)
+                           VALUES (?, ?, ?, ?, ?)
+                           ''', (username, password_hash, role, full_name, email))
+            conn.commit()
             return True
-        except Exception:
+        except sqlite3.IntegrityError:
             return False
+        finally:
+            conn.close()
 
-    def authenticate_user(self, username: str,
-                          password: str) -> Optional[Dict[str, Any]]:
-        doc = self.users.find_one({
-            "username": username,
-            "password_hash": self.hash_password(password)
-        })
-        return self._user_doc(doc)
+    def authenticate_user(self, username: str, password: str) -> Optional[Dict[str, Any]]:
+        """Authenticate user and return user info"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
 
-    def get_all_students(self) -> List[Dict[str, Any]]:
-        cursor = self.users.find({"role": "student"})
-        return [self._user_doc(c) for c in cursor]
+        password_hash = self.hash_password(password)
+        cursor.execute('''
+                       SELECT id, username, role, full_name, email
+                       FROM users
+                       WHERE username = ?
+                         AND password_hash = ?
+                       ''', (username, password_hash))
 
-    # ───── Session Management ─────
-    def create_session(self, lecturer_id: str,
-                       title: str, description: str = "") -> str:
+        user = cursor.fetchone()
+        conn.close()
+
+        if user:
+            return {
+                'id': user[0],
+                'username': user[1],
+                'role': user[2],
+                'full_name': user[3],
+                'email': user[4]
+            }
+        return None
+
+    def create_session(self, lecturer_id: int, title: str, description: str = "") -> str:
+        """Create a new lecture session"""
         session_id = str(uuid.uuid4())
-        self.lecture_sessions.insert_one({
-            "session_id": session_id,
-            "lecturer_id": lecturer_id,
-            "title": title,
-            "description": description,
-            "status": "planned",
-            "created_at": datetime.utcnow()
-        })
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        cursor.execute('''
+                       INSERT INTO lecture_sessions (session_id, lecturer_id, title, description)
+                       VALUES (?, ?, ?, ?)
+                       ''', (session_id, lecturer_id, title, description))
+
+        conn.commit()
+        conn.close()
         return session_id
 
     def get_session_by_id(self, session_id: str) -> Optional[Dict[str, Any]]:
-        session = self.lecture_sessions.find_one({"session_id": session_id})
-        if not session:
-            return None
-        lect = self.users.find_one({"_id": ObjectId(session["lecturer_id"])})
-        session["lecturer_name"] = lect["full_name"] if lect else "Unknown"
-        session["id"] = str(session["_id"])
-        return session
+        """Get session information by session ID"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        cursor.execute('''
+                       SELECT ls.*, u.full_name as lecturer_name
+                       FROM lecture_sessions ls
+                                JOIN users u ON ls.lecturer_id = u.id
+                       WHERE ls.session_id = ?
+                       ''', (session_id,))
+
+        session = cursor.fetchone()
+        conn.close()
+
+        if session:
+            return {
+                'id': session[0],
+                'session_id': session[1],
+                'lecturer_id': session[2],
+                'title': session[3],
+                'description': session[4],
+                'start_time': session[5],
+                'end_time': session[6],
+                'status': session[7],
+                'created_at': session[8],
+                'lecturer_name': session[9]
+            }
+        return None
 
     def start_session(self, session_id: str) -> bool:
-        res = self.lecture_sessions.update_one(
-            {"session_id": session_id, "status": "planned"},
-            {"$set": {"status": "active", "start_time": datetime.utcnow()}}
-        )
-        return res.modified_count == 1
+        """Start a lecture session"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        cursor.execute('''
+                       UPDATE lecture_sessions
+                       SET status     = 'active',
+                           start_time = CURRENT_TIMESTAMP
+                       WHERE session_id = ?
+                       ''', (session_id,))
+
+        conn.commit()
+        success = cursor.rowcount > 0
+        conn.close()
+        return success
 
     def end_session(self, session_id: str) -> bool:
-        res = self.lecture_sessions.update_one(
-            {"session_id": session_id, "status": "active"},
-            {"$set": {"status": "ended", "end_time": datetime.utcnow()}}
-        )
-        return res.modified_count == 1
+        """End a lecture session"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
 
-    # ───── Participants ─────
-    def join_session(self, session_id: str, student_id: str) -> bool:
-        already = self.session_participants.find_one({
-            "session_id": session_id,
-            "student_id": student_id,
-            "left_at": None
-        })
-        if already:
-            return True
-        self.session_participants.insert_one({
-            "session_id": session_id,
-            "student_id": student_id,
-            "joined_at": datetime.utcnow(),
-            "left_at": None
-        })
-        return True
+        cursor.execute('''
+                       UPDATE lecture_sessions
+                       SET status   = 'ended',
+                           end_time = CURRENT_TIMESTAMP
+                       WHERE session_id = ?
+                       ''', (session_id,))
 
-    def leave_session(self, session_id: str, student_id: str) -> bool:
-        res = self.session_participants.update_one(
-            {"session_id": session_id, "student_id": student_id,
-             "left_at": None},
-            {"$set": {"left_at": datetime.utcnow()}}
-        )
-        return res.modified_count == 1
+        conn.commit()
+        success = cursor.rowcount > 0
+        conn.close()
+        return success
 
-    def get_session_participants(self,
-                                 session_id: str) -> List[Dict[str, Any]]:
-        pipeline = [
-            {"$match": {"session_id": session_id}},
-            {"$lookup": {
-                "from": "users",
-                "localField": "student_id",
-                "foreignField": "_id",
-                "as": "user_doc"}},
-            {"$unwind": "$user_doc"},
-            {"$sort": {"joined_at": -1}}
-        ]
-        parts = []
-        for doc in self.session_participants.aggregate(pipeline):
-            parts.append({
-                "id": str(doc["user_doc"]["_id"]),
-                "full_name": doc["user_doc"]["full_name"],
-                "username": doc["user_doc"]["username"],
-                "joined_at": doc["joined_at"],
-                "left_at": doc["left_at"],
-                "is_active": doc["left_at"] is None
+    def join_session(self, session_id: str, student_id: int) -> bool:
+        """Student joins a session"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        # Check if already joined
+        cursor.execute('''
+                       SELECT id
+                       FROM session_participants
+                       WHERE session_id = ?
+                         AND student_id = ?
+                         AND left_at IS NULL
+                       ''', (session_id, student_id))
+
+        if cursor.fetchone():
+            conn.close()
+            return True  # Already joined
+
+        cursor.execute('''
+                       INSERT INTO session_participants (session_id, student_id, joined_at)
+                       VALUES (?, ?, CURRENT_TIMESTAMP)
+                       ''', (session_id, student_id))
+
+        conn.commit()
+        success = cursor.rowcount > 0
+        conn.close()
+        return success
+
+    def leave_session(self, session_id: str, student_id: int) -> bool:
+        """Student leaves a session"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        cursor.execute('''
+                       UPDATE session_participants
+                       SET left_at = CURRENT_TIMESTAMP
+                       WHERE session_id = ?
+                         AND student_id = ?
+                         AND left_at IS NULL
+                       ''', (session_id, student_id))
+
+        conn.commit()
+        success = cursor.rowcount > 0
+        conn.close()
+        return success
+
+    def get_session_participants(self, session_id: str) -> List[Dict[str, Any]]:
+        """Get all participants in a session"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        cursor.execute('''
+                       SELECT u.id, u.full_name, u.username, sp.joined_at, sp.left_at
+                       FROM session_participants sp
+                                JOIN users u ON sp.student_id = u.id
+                       WHERE sp.session_id = ?
+                       ORDER BY sp.joined_at DESC
+                       ''', (session_id,))
+
+        participants = []
+        for row in cursor.fetchall():
+            participants.append({
+                'id': row[0],
+                'full_name': row[1],
+                'username': row[2],
+                'joined_at': row[3],
+                'left_at': row[4],
+                'is_active': row[4] is None
             })
-        return parts
 
-    # ───── CRUD: attention data ─────
-    def save_attention_data(self, session_id: str, student_id: str,
-                            data: Dict[str, Any]):
-        data_doc = {
-            **data,
-            "session_id": session_id,
-            "student_id": student_id
-        }
-        self.attention_data.insert_one(data_doc)
+        conn.close()
+        return participants
 
-    def get_attention_data(self, session_id: str,
-                           student_id: str = None) -> pd.DataFrame:
-        query = {"session_id": session_id}
+    def save_attention_data(self, session_id: str, student_id: int, data: Dict[str, Any]):
+        """Save attention tracking data"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        cursor.execute('''
+                       INSERT INTO attention_data (session_id, student_id, timestamp, yaw, pitch,
+                                                   left_h, left_v, right_h, right_v, prob, smoothed_prob,
+                                                   attention_status)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       ''', (
+                           session_id, student_id, data['timestamp'], data.get('yaw'), data.get('pitch'),
+                           data.get('left_h'), data.get('left_v'), data.get('right_h'), data.get('right_v'),
+                           data.get('prob'), data.get('smoothed_prob'), data.get('attention')
+                       ))
+
+        conn.commit()
+        conn.close()
+
+    def get_attention_data(self, session_id: str, student_id: int = None) -> pd.DataFrame:
+        """Get attention data for a session"""
+        conn = sqlite3.connect(self.db_path)
+
         if student_id:
-            query["student_id"] = student_id
+            query = '''
+                    SELECT * \
+                    FROM attention_data
+                    WHERE session_id = ? \
+                      AND student_id = ?
+                    ORDER BY timestamp \
+                    '''
+            df = pd.read_sql_query(query, conn, params=(session_id, student_id))
+        else:
+            query = '''
+                    SELECT ad.*, u.full_name, u.username
+                    FROM attention_data ad
+                             JOIN users u ON ad.student_id = u.id
+                    WHERE ad.session_id = ?
+                    ORDER BY ad.timestamp \
+                    '''
+            df = pd.read_sql_query(query, conn, params=(session_id,))
 
-        cur = self.attention_data.find(query).sort("timestamp", ASCENDING)
-        rows = list(cur)
-        if not rows:
-            return pd.DataFrame()
+        conn.close()
 
-        # Optional join to user (only when we pull all students at once)
-        if student_id is None:
-            # map user_id -> info
-            users_map = {
-                str(u["_id"]): u
-                for u in self.users.find({"role": "student"})
-            }
-            for r in rows:
-                u = users_map.get(r["student_id"])
-                if u:
-                    r["full_name"] = u["full_name"]
-                    r["username"]  = u["username"]
+        if not df.empty and 'timestamp' in df.columns:
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
 
-        df = pd.DataFrame(rows)
-        if "timestamp" in df.columns:
-            df["timestamp"] = pd.to_datetime(df["timestamp"])
         return df
 
-    # ───── Helper queries for dashboards ─────
-    def get_lecturer_sessions(self, lecturer_id: str) -> List[Dict[str, Any]]:
-        cursor = self.lecture_sessions.find(
-            {"lecturer_id": lecturer_id}).sort("created_at", -1)
+    def get_lecturer_sessions(self, lecturer_id: int) -> List[Dict[str, Any]]:
+        """Get all sessions created by a lecturer"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        cursor.execute('''
+                       SELECT *
+                       FROM lecture_sessions
+                       WHERE lecturer_id = ?
+                       ORDER BY created_at DESC
+                       ''', (lecturer_id,))
+
         sessions = []
-        for s in cursor:
-            s["id"] = str(s["_id"])
-            sessions.append(s)
+        for row in cursor.fetchall():
+            sessions.append({
+                'id': row[0],
+                'session_id': row[1],
+                'lecturer_id': row[2],
+                'title': row[3],
+                'description': row[4],
+                'start_time': row[5],
+                'end_time': row[6],
+                'status': row[7],
+                'created_at': row[8]
+            })
+
+        conn.close()
         return sessions
 
-    def get_student_sessions(self, student_id: str) -> List[Dict[str, Any]]:
-        pipeline = [
-            {"$match": {"student_id": student_id}},
-            {"$group": {"_id": "$session_id"}},
-            {"$lookup": {
-                "from": "lecture_sessions",
-                "localField": "_id",
-                "foreignField": "session_id",
-                "as": "session_doc"}},
-            {"$unwind": "$session_doc"},
-            {"$lookup": {
-                "from": "users",
-                "localField": "session_doc.lecturer_id",
-                "foreignField": "_id",
-                "as": "lecturer"}},
-            {"$unwind": "$lecturer"},
-            {"$sort": {"session_doc.created_at": -1}}
-        ]
+    def get_student_sessions(self, student_id: int) -> List[Dict[str, Any]]:
+        """Get all sessions a student has participated in"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        cursor.execute('''
+                       SELECT DISTINCT ls.*, u.full_name as lecturer_name
+                       FROM lecture_sessions ls
+                                JOIN session_participants sp ON ls.session_id = sp.session_id
+                                JOIN users u ON ls.lecturer_id = u.id
+                       WHERE sp.student_id = ?
+                       ORDER BY ls.created_at DESC
+                       ''', (student_id,))
+
         sessions = []
-        for doc in self.session_participants.aggregate(pipeline):
-            s = doc["session_doc"]
-            s["lecturer_name"] = doc["lecturer"]["full_name"]
-            s["id"] = str(s["_id"])
-            sessions.append(s)
+        for row in cursor.fetchall():
+            sessions.append({
+                'id': row[0],
+                'session_id': row[1],
+                'lecturer_id': row[2],
+                'title': row[3],
+                'description': row[4],
+                'start_time': row[5],
+                'end_time': row[6],
+                'status': row[7],
+                'created_at': row[8],
+                'lecturer_name': row[9]
+            })
+
+        conn.close()
         return sessions
+
+    def get_all_students(self) -> List[Dict[str, Any]]:
+        """Get all students in the system"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        cursor.execute('''
+                       SELECT id, username, full_name, email
+                       FROM users
+                       WHERE role = 'student'
+                       ORDER BY full_name
+                       ''')
+
+        students = []
+        for row in cursor.fetchall():
+            students.append({
+                'id': row[0],
+                'username': row[1],
+                'full_name': row[2],
+                'email': row[3]
+            })
+
+        conn.close()
+        return students
+
 
 # ────────────────────────────────────────────────────────────
 # ML MODEL
 # ────────────────────────────────────────────────────────────
+
 class GazeClassifier(nn.Module):
     def __init__(self):
         super().__init__()
@@ -684,14 +990,16 @@ class StudentAttentionVideoProcessor(VideoProcessorBase):
 # ────────────────────────────────────────────────────────────
 
 def initialize_session_state():
-    """Initialize Streamlit session_state keys."""
-    if "user" not in st.session_state:
+    """Initialize session state variables"""
+    if 'user' not in st.session_state:
         st.session_state.user = None
-    if "current_session" not in st.session_state:
+    if 'current_session' not in st.session_state:
         st.session_state.current_session = None
-    if "db_manager" not in st.session_state:
+    if 'attention_data' not in st.session_state:
+        st.session_state.attention_data = []
+    if 'db_manager' not in st.session_state:
         st.session_state.db_manager = DatabaseManager()
-    if "selected_session_analytics" not in st.session_state:
+    if 'selected_session_analytics' not in st.session_state:
         st.session_state.selected_session_analytics = None
 
 
@@ -829,33 +1137,41 @@ def show_lecturer_sessions():
 
 
 def create_new_session():
-    """Create a new lecture session"""
+    
     st.subheader("Create New Session")
 
+    # -------- FORM --------
     with st.form("create_session_form"):
         title = st.text_input("Session Title", placeholder="e.g., Introduction to Machine Learning")
-        description = st.text_area("Description (Optional)", placeholder="Brief description of the lecture...")
+        description = st.text_area("Description (Optional)",
+                                   placeholder="Brief description of the lecture…")
+        submitted = st.form_submit_button("Create Session")
 
-        submit = st.form_submit_button("Create Session")
+    # -------- AFTER THE FORM SUBMITS --------
+    if submitted:
+        if title:
+            session_id = st.session_state.db_manager.create_session(
+                st.session_state.user['id'], title, description
+            )
+            # Remember the new session so the button outside the form can use it
+            st.session_state.new_session_id = session_id
 
-        if submit:
-            if title:
-                session_id = st.session_state.db_manager.create_session(
-                    st.session_state.user['id'], title, description
-                )
-                st.success(f"Session created successfully!")
+            st.success("Session created successfully!")
+            st.info(f"**Session ID:** `{session_id}`")
+            st.info("📋 **Share this Session ID with your students so they can join.**")
+        else:
+            st.error("Please enter a session title")
 
-                # Display session details in a nice format
-                st.info(f"**Session ID:** `{session_id}`")
-                st.info("📋 **Share this Session ID with your students so they can join.**")
+    # -------- OPTIONAL “START NOW” BUTTON --------
+    if st.session_state.get("new_session_id"):
+        if st.button("Start Session Now"):
+            st.session_state.db_manager.start_session(st.session_state.new_session_id)
+            st.session_state.current_session = st.session_state.new_session_id
+            st.success("Session started!")
+            # Clean up
+            del st.session_state.new_session_id
+            st.experimental_rerun()
 
-                # Option to start immediately
-                if st.button("Start Session Now"):
-                    st.session_state.db_manager.start_session(session_id)
-                    st.session_state.current_session = session_id
-                    st.rerun()
-            else:
-                st.error("Please enter a session title")
 
 
 def manage_active_session():
